@@ -28,12 +28,15 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::consumer::{AutoCommit, IggyConsumer, py_delta_to_iggy_duration};
+use crate::consumer::{
+    AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
+    IggyConsumer, py_delta_to_iggy_duration,
+};
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
-use crate::topic::TopicDetails;
+use crate::topic::{Topic, TopicDetails};
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
@@ -60,7 +63,7 @@ impl IggyClient {
             .with_tcp()
             .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(|e| crate::error::map_iggy_error(e))?;
         Ok(IggyClient {
             inner: Arc::new(client),
         })
@@ -77,7 +80,7 @@ impl IggyClient {
         connection_string: String,
     ) -> PyResult<Self> {
         let client = RustIggyClient::from_connection_string(&connection_string)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(|e| crate::error::map_iggy_error(e))?;
         Ok(Self {
             inner: Arc::new(client),
         })
@@ -93,7 +96,7 @@ impl IggyClient {
             inner
                 .ping()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                .map_err(|e| crate::error::map_iggy_error(e))
         })
     }
 
@@ -111,7 +114,7 @@ impl IggyClient {
             inner
                 .login_user(&username, &password)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(())
         })
     }
@@ -125,7 +128,7 @@ impl IggyClient {
             inner
                 .connect()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(())
         })
     }
@@ -140,7 +143,7 @@ impl IggyClient {
             inner
                 .create_stream(&name)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(())
         })
     }
@@ -160,7 +163,7 @@ impl IggyClient {
             let stream = inner
                 .get_stream(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(stream.map(StreamDetails::from))
         })
     }
@@ -190,7 +193,7 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+                .map_err(|e| crate::error::map_iggy_error(e))?,
             None => CompressionAlgorithm::default(),
         };
 
@@ -216,7 +219,7 @@ impl IggyClient {
                     max_size,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(())
         })
     }
@@ -238,8 +241,277 @@ impl IggyClient {
             let topic = inner
                 .get_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(topic.map(TopicDetails::from))
+        })
+    }
+
+    /// Get all topics in a stream.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[Topic]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the identifier is invalid or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Topic]]", imports=("collections.abc")))]
+    fn get_topics<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let topics = inner
+                .get_topics(&stream_id)
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(topics.into_iter().map(Topic::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Update an existing topic.
+    ///
+    /// This is a full replacement: any optional parameter left unset is reset to
+    /// its server default rather than preserved.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     name: New topic name as `str`.
+    ///     compression_algorithm: Compression algorithm as `str | None`.
+    ///     replication_factor: Replication factor as `int | None`.
+    ///     message_expiry: Message expiry as `datetime.timedelta | None`.
+    ///     max_topic_size: Maximum topic size in bytes as `int | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is updated.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    #[pyo3(
+        signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
+    )]
+    #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_topic<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        name: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
+            u8,
+        >,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        message_expiry: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let compression_algorithm = match compression_algorithm {
+            Some(algo) => CompressionAlgorithm::from_str(&algo)
+                .map_err(|e| crate::error::map_iggy_error(e))?,
+            None => CompressionAlgorithm::default(),
+        };
+
+        let expiry = match message_expiry {
+            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
+            None => IggyExpiry::ServerDefault,
+        };
+
+        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_topic(
+                    &stream_id,
+                    &topic_id,
+                    &name,
+                    compression_algorithm,
+                    replication_factor,
+                    expiry,
+                    max_size,
+                )
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(())
+        })
+    }
+
+    /// Delete a topic from a stream.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is deleted.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_topic<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_topic(&stream_id, &topic_id)
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(())
+        })
+    }
+
+    /// Purge all messages from a topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is purged.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn purge_topic<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .purge_topic(&stream_id, &topic_id)
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(())
+        })
+    }
+
+    /// Create a consumer group for a stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     name: Consumer group name as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the consumer group is created.
+    ///
+    /// Raises:
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn create_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        name: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .create_consumer_group(&stream_id, &topic_id, &name)
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(())
+        })
+    }
+
+    /// Retrieve details for a consumer group from the specified stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `ConsumerGroupDetails` if the consumer group exists,
+    ///     or `None` otherwise.
+    ///
+    /// Raises:
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupDetails | None]", imports=("collections.abc")))]
+    fn get_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let group = inner
+                .get_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(group.map(PyConsumerGroupDetails::from))
+        })
+    }
+
+    /// Get all consumer groups for the specified stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[ConsumerGroup]`.
+    ///
+    /// Raises:
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ConsumerGroup]]", imports=("collections.abc")))]
+    fn get_consumer_groups<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let groups = inner
+                .get_consumer_groups(&stream_id, &topic_id)
+                .await
+                .map_err(|e| crate::error::map_iggy_error(e))?;
+            Ok(groups
+                .into_iter()
+                .map(PyConsumerGroup::from)
+                .collect::<Vec<_>>())
         })
     }
 
@@ -275,7 +547,7 @@ impl IggyClient {
             inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(())
         })
     }
@@ -313,7 +585,7 @@ impl IggyClient {
                     auto_commit,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             let messages = polled_messages
                 .messages
                 .into_iter()
@@ -374,7 +646,7 @@ impl IggyClient {
         let mut builder = self
             .inner
             .consumer_group(name, stream, topic)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(|e| crate::error::map_iggy_error(e))?
             .without_encryptor()
             .partition(partition_id);
 
@@ -432,7 +704,7 @@ impl IggyClient {
             consumer
                 .init()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| crate::error::map_iggy_error(e))?;
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
             })
